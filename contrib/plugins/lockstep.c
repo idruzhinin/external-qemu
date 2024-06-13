@@ -129,8 +129,13 @@ static void report_divergance(ExecState *us, ExecState *them)
             diverged = true;
         }
     }
+#if !(GLIB_CHECK_VERSION(2, 67, 3))
+    divergence_log = g_slist_prepend(divergence_log,
+                                     g_memdup(&divrec, sizeof(divrec)));
+#else
     divergence_log = g_slist_prepend(divergence_log,
                                      g_memdup2(&divrec, sizeof(divrec)));
+#endif
 
     /* Output short log entry of going out of sync... */
     if (verbose || divrec.distance == 1 || diverged) {
