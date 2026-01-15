@@ -924,6 +924,76 @@ process_memwr(int fd, simmsg_t *m)
     simc_writeres(bdf, addr, size, 0);
 }
 
+static int
+process_ats(int fd, simmsg_t *m)
+{
+    u_int16_t bdf  = m->u.ats_req.bdf;
+    const u_int64_t addr = m->u.ats_req.addr;
+    const u_int32_t length = m->u.ats_req.length;
+    const u_int32_t size = length * sizeof(uint64_t);
+    const bool no_write = m->u.ats_req.addr & 1;
+    char buf[4096];
+    ssize_t res;
+
+    dbgprintf("ats_req: bdf %04x addr 0x%"PRIx64" length 0x%x\n",
+              bdf, addr, length);
+
+    if (size > sizeof(buf)) {
+        dbgprintf("process_ats: ats request size too large: 0x%x\n", size);
+        simc_atsres(bdf, addr, size, NULL, E2BIG);
+        return -1;
+    }
+
+    if (!bdf) {
+        bdf = last_bdf;
+    }
+
+    if (bdf) {
+        SimDevice *sd;
+        PCIDevice *pd;
+        IOMMUTLBEntry entries[sizeof(buf) / sizeof(uint64_t)];
+        uint32_t err_count;
+        int i;
+
+        /*
+         * bdf was provided so use that device context for memory access.
+         */
+        sd = simdevices_find_bdf(bdf);
+        if (sd == NULL) {
+            dbgprintf("process_ats: bdf %04x not found\n", bdf);
+            simc_atsres(bdf, addr, length, NULL, ENODEV);
+            return -1;
+        }
+        pd = PCI_DEVICE(sd);
+        /* assume STU 0 as that's what Qemu only supports */
+        res = pci_ats_request_translation(pd, PCI_NO_PASID, false, false,
+                                          addr, length * 4096, no_write, entries,
+                                          ARRAY_SIZE(entries), &err_count);
+        if (res < 0) {
+            u_int8_t error = (u_int8_t)-res;
+            dbgprintf("process_ats: translation error %d\n", error);
+            simc_atsres(bdf, addr, length, NULL, error);
+            return -1;
+        }
+        for (i = 0; i < res; i++) {
+            uint64_t *result = (uint64_t *)buf;
+            result[i] = (entries[i].translated_addr & ~entries[i].addr_mask);
+            /* the expression below corresponds to Table 10-5 of PCIe spec */
+            result[i] |= (entries[i].addr_mask >> 1) & ~((1UL << 11) - 1);
+            result[i] |= (entries[i].perm & IOMMU_RW);
+        }
+        /* positive err_count is not an error in itself and ATC should cope */
+        dbgprintf("process_ats: error count %d\n", err_count);
+    } else {
+        dbgprintf("process_ats: no bdf given\n");
+        simc_atsres(bdf, addr, length, NULL, EINVAL);
+        return -1;
+    }
+
+    dbgprinthex(4, (u_int8_t *)buf, size);
+    return simc_atsres(bdf, addr, res, buf, 0);
+}
+
 static void
 msg_handler(int fd, simmsg_t *m)
 {
@@ -938,6 +1008,9 @@ msg_handler(int fd, simmsg_t *m)
         break;
     case SIMMSG_SYNC_REQ:
         simc_sync_ack();
+        break;
+    case SIMMSG_ATS_REQ:
+        process_ats(fd, m);
         break;
     default:
         dbgprintf("unknown msg type %d\n", m->msgtype);
